@@ -1,0 +1,2 @@
+import Link from "next/link";
+export function FixFlowLogo({compact=false}:{compact?:boolean}){return <Link href="/" className="inline-flex items-center gap-3 font-semibold tracking-[-.04em]"><span className="grid h-9 w-9 place-items-center rounded-xl bg-[linear-gradient(135deg,#f199ba,#9a7cf2_48%,#69c4ea_75%,#73d9ad)] text-lg text-white shadow-[0_8px_24px_rgba(143,108,240,.28)]">F</span>{!compact&&<span className="text-xl">FixFlow</span>}</Link>}

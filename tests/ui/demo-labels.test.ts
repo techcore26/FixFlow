@@ -1,0 +1,2 @@
+import assert from "node:assert/strict"; import test from "node:test"; import { disclosure } from "../../src/lib/demo-labels";
+test("demo integrations and impact are explicitly disclosed",()=>{assert.match(disclosure.telemetry,/Simulated/);assert.match(disclosure.slack,/Simulated/);assert.match(disclosure.onCall,/Illustrative/);assert.match(disclosure.impact,/Illustrative/);assert.match(disclosure.switch,/not connected/)});

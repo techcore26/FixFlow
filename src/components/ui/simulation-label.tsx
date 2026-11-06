@@ -1,0 +1,1 @@
+export function SimulationLabel({children}:{children:React.ReactNode}){return <span className="mono inline-flex rounded-full border border-violet-200 bg-violet-50/80 px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[.12em] text-violet-700">{children}</span>}

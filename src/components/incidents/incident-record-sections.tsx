@@ -1,0 +1,71 @@
+import type { Approval, Execution, ExecutionAttempt, IncidentDetails, Investigation } from "@/lib/types";
+import type { WorkspaceContentId } from "@/lib/incident-presentation";
+import { investigationSource, parseApprovedSnapshot, preserveLogPresentation } from "@/lib/incident-presentation";
+import { dateTime, humanize } from "@/lib/format";
+import { AuditIcon, InvestigateIcon, ShieldIcon } from "../ui/icons";
+import { StatusBadge } from "../ui/status-badge";
+import { AuditTimeline } from "./audit-timeline";
+
+export function IncidentRecordSections({ data, channel }: { data: IncidentDetails; channel?: WorkspaceContentId }) {
+  const source = investigationSource(data);
+  const show = (name: WorkspaceContentId) => !channel || channel === name;
+  const latestDecision = data.approvals.at(-1);
+  const latestApproved = latestDecision?.decision === "APPROVED" ? latestDecision : undefined;
+  const currentInvestigation = latestApproved ? data.investigations.find(item => item.id === latestApproved.investigationId) : data.incident.status === "AWAITING_APPROVAL" ? data.investigations.at(-1) : undefined;
+  const latestSuccessful = [...data.executions].reverse().find(item => item.status === "SUCCEEDED");
+
+  return <div className="space-y-4">
+    {show("overview") && <section className="incident-panel"><Heading icon={<InvestigateIcon />} eyebrow="Recorded state" title="Incident overview" /><p className="mt-5 whitespace-pre-wrap text-sm leading-7 text-[var(--ink-soft)]">{data.incident.description}</p><div className="mt-5 grid gap-3 sm:grid-cols-2"><Datum label="Current status" value={humanize(data.incident.status)} /><Datum label="Record version" value={`v${data.incident.version}`} /><Datum label="Investigations" value={String(data.investigations.length)} /><Datum label="Audit events" value={String(data.auditEvents.length)} /></div></section>}
+    {show("overview-current") && <section className="incident-panel"><Heading icon={<ShieldIcon />} eyebrow="Current accepted records" title="Accepted investigation and validation" /><div className="workspace-current-records">
+      {currentInvestigation ? <InvestigationCard investigation={currentInvestigation} label="Current investigation" /> : <Empty text="No accepted investigation record exists yet." />}
+      {latestApproved ? <ApprovalCard approval={latestApproved} investigation={data.investigations.find(item => item.id === latestApproved.investigationId)} label="Current immutable decision" /> : <Empty text="No approved action is currently recorded." />}
+      {latestSuccessful ? <ExecutionCard execution={latestSuccessful} approval={data.approvals.find(item => item.id === latestSuccessful.approvalId)} label="Successful record-only outcome" /> : <Empty text="No successful record-only outcome has been recorded." />}
+    </div></section>}
+    {show("investigation") && <section className="incident-panel"><Heading icon={<InvestigateIcon />} eyebrow="Evidence" title="Evidence and source"><span className={`incident-source incident-source--${source.kind}`}>{source.label}</span></Heading><div className="incident-source__detail"><p>{source.detail}</p><span>Future Switch activity will be separately attributed after integration is verified.</span></div><Empty text="No structured evidence is stored for this investigation." /></section>}
+    {show("activity-log") && <section className="incident-panel"><Heading icon={<AuditIcon />} eyebrow="Immutable history" title="Audit timeline"><span className="text-xs text-[var(--muted)]">{data.auditEvents.length} events</span></Heading><div className="mt-6"><AuditTimeline events={data.auditEvents} /></div></section>}
+    {show("preserve-log") && <PreserveLog data={data} />}
+  </div>;
+}
+
+function PreserveLog({ data }: { data: IncidentDetails }) {
+  const presentation = preserveLogPresentation(data);
+  const ungroupedCount = presentation.ungrouped.approvals.length + presentation.ungrouped.executions.length + presentation.ungrouped.attempts.length;
+  return <div className="workspace-preserve-log">
+    {presentation.groups.length ? presentation.groups.map(({ investigation, decisions }, index) => <section className="incident-panel workspace-preserve-log__entry" key={investigation.id} aria-labelledby={`preserve-log-${investigation.id}`}>
+      <header className="workspace-preserve-log__entry-header"><div><p className="eyebrow">Immutable workflow history</p><h3 id={`preserve-log-${investigation.id}`}>LOG #{index + 1}</h3></div><span>{dateTime(investigation.createdAt)}</span></header>
+      <section className="workspace-preserve-log__group"><h4>Investigation #{index + 1}</h4><InvestigationCard investigation={investigation} label="Recorded investigation" latest={index === presentation.groups.length - 1} /></section>
+      <section className="workspace-preserve-log__group"><h4>Decisions linked to Investigation #{index + 1}</h4>{decisions.length ? <div className="workspace-preserve-log__decision-list">{decisions.map(({ approval, executions, attemptsByExecution }, decisionIndex) => <section className="workspace-preserve-log__decision" key={approval.id}><ApprovalCard approval={approval} investigation={investigation} label={`Decision #${decisionIndex + 1}`} />
+        <div className="workspace-preserve-log__attempts"><h5>Execution attempts and outcomes</h5>{executions.length ? executions.map(execution => { const attempts = attemptsByExecution.get(execution.id) ?? []; return <section key={execution.id} className="workspace-preserve-log__execution">{attempts.length ? attempts.map(attempt => <ExecutionAttemptCard key={attempt.id} attempt={attempt} execution={execution} approval={approval} investigation={investigation} />) : <HistoryEmpty text="No immutable execution attempt has been persisted for this execution record." />}</section>; }) : <HistoryEmpty text="No execution tracking record is linked to this decision." />}</div>
+      </section>)}</div> : <HistoryEmpty text="No human decision is linked to this investigation." />}</section>
+    </section>) : <section className="incident-panel"><Heading icon={<InvestigateIcon />} eyebrow="Immutable history" title="Preserve Log" /><Empty text="No investigation records have been persisted." /></section>}
+    {ungroupedCount ? <section className="incident-panel workspace-preserve-log__ungrouped"><Heading icon={<ShieldIcon />} eyebrow="Relationship warning" title="Ungrouped records"><span className="text-xs text-[var(--muted)]">{ungroupedCount} record{ungroupedCount === 1 ? "" : "s"}</span></Heading><p className="workspace-preserve-log__notice">These persisted records could not be linked through their recorded relationships and are intentionally not attached to a LOG.</p><div className="workspace-history-list">{presentation.ungrouped.approvals.map(approval => <ApprovalCard key={approval.id} approval={approval} label="Ungrouped decision" />)}{presentation.ungrouped.executions.map(execution => <ExecutionCard key={execution.id} execution={execution} label="Ungrouped execution record" />)}{presentation.ungrouped.attempts.map(attempt => <ExecutionAttemptCard key={attempt.id} attempt={attempt} label={attempt.source === "LEGACY_AGGREGATE" ? "Legacy aggregate record" : `Ungrouped attempt #${attempt.attemptNumber}`} />)}</div></section> : null}
+  </div>;
+}
+
+function InvestigationCard({ investigation, label, latest = false }: { investigation: Investigation; label: string; latest?: boolean }) {
+  return <article className="workspace-history-card"><HistoryHeader label={label} status={investigation.status} createdAt={investigation.createdAt} latest={latest} /><div className="workspace-history-card__blocks"><Block label="Recorded findings" value={investigation.findings || investigation.errorMessage || "No findings were recorded."} /><Block label="Proposed resolution" value={investigation.proposedResolution || "No bounded resolution proposal was recorded."} subdued={!investigation.proposedResolution} /><Block label="Investigation summary" value={investigation.summary || "No brief summary was recorded for this legacy investigation."} subdued={!investigation.summary} /></div><Metadata values={[["Completed", investigation.completedAt ? dateTime(investigation.completedAt) : "Not completed"], ["Source", investigation.externalReference || "Manual local operator"]]} /></article>;
+}
+
+function ApprovalCard({ approval, investigation, label, latest = false }: { approval: Approval; investigation?: Investigation; label: string; latest?: boolean }) {
+  const snapshot = parseApprovedSnapshot(approval);
+  return <article className="workspace-history-card"><HistoryHeader label={label} status={approval.decision} createdAt={approval.createdAt} latest={latest} /><div className="workspace-history-card__blocks"><Block label="Decision rationale" value={approval.rationale || "No rationale recorded."} />{approval.decision === "APPROVED" ? <Block label="Exact immutable action" value={snapshot.summary || snapshot.raw || "No displayable action summary."} /> : <Block label="Decision outcome" value={humanize(approval.decision)} subdued />}</div><Metadata values={[["Operator", approval.actor], ["Investigation", investigation ? investigation.id : "Linked investigation is unavailable"]]} /></article>;
+}
+
+function ExecutionCard({ execution, approval, investigation, label, latest = false }: { execution: Execution; approval?: Approval; investigation?: Investigation; label: string; latest?: boolean }) {
+  const outcome = execution.status === "SUCCEEDED" ? execution.resultSummary || "A successful record-only outcome was recorded without a summary." : execution.errorMessage || execution.resultSummary || execution.requestSummary || "Tracking started; no outcome recorded.";
+  return <article className="workspace-history-card"><HistoryHeader label={label} status={execution.status} createdAt={execution.createdAt} latest={latest} /><div className="workspace-history-card__blocks"><Block label={execution.status === "SUCCEEDED" ? "Successful record-only outcome" : "Recorded tracking state"} value={outcome} /></div><Metadata values={[["Started", execution.startedAt ? dateTime(execution.startedAt) : "Not started"], ["Finished", execution.finishedAt ? dateTime(execution.finishedAt) : "Not finished"], ["Decision", approval ? approval.id : "Linked decision is unavailable"], ["Investigation", investigation ? investigation.id : "Unavailable"]]} /></article>;
+}
+
+function ExecutionAttemptCard({ attempt, execution, approval, investigation, latest = false, label }: { attempt: ExecutionAttempt; execution?: Execution; approval?: Approval; investigation?: Investigation; latest?: boolean; label?: string }) {
+  const legacy = attempt.source === "LEGACY_AGGREGATE";
+  const outcome = attempt.status === "SUCCEEDED" ? attempt.resultSummary || "A successful record-only outcome was recorded without a summary." : attempt.errorMessage || attempt.resultSummary || "Tracking started; no outcome recorded.";
+  return <article className="workspace-history-card"><HistoryHeader label={label || (legacy ? "Legacy aggregate record" : `Attempt #${attempt.attemptNumber}`)} status={attempt.status} createdAt={attempt.createdAt} latest={latest} /><div className="workspace-history-card__blocks"><Block label="Tracking note" value={attempt.requestSummary || "No tracking note was recorded."} subdued={!attempt.requestSummary} /><Block label={attempt.status === "SUCCEEDED" ? "Successful record-only outcome" : attempt.status === "FAILED" ? "Recorded failure" : "Recorded tracking state"} value={outcome} subdued={attempt.status === "RUNNING"} /></div>{legacy && <p className="workspace-history-card__legacy">This is the execution aggregate as it existed when immutable attempts were introduced. Earlier retry details were not persisted and are not reconstructed.</p>}<Metadata values={[["Started", attempt.startedAt ? dateTime(attempt.startedAt) : "Not started"], ["Finished", attempt.finishedAt ? dateTime(attempt.finishedAt) : "Not finished"], ["Execution", execution ? execution.id : "Linked execution is unavailable"], ["Decision", approval ? approval.id : "Linked decision is unavailable"], ["Investigation", investigation ? investigation.id : "Unavailable"]]} /></article>;
+}
+
+function HistoryHeader({ label, status, createdAt, latest }: { label: string; status: string; createdAt: string; latest: boolean }) { return <div className="workspace-history-card__header"><div><p className="workspace-history-card__label">{label}</p><time className="mono text-[9px] text-[var(--faint)]">{dateTime(createdAt)}</time></div><div className="flex items-center gap-2">{latest && <span className="workspace-history-card__latest">Latest</span>}<StatusBadge value={status} /></div></div>; }
+function Metadata({ values }: { values: [string, string][] }) { return <dl className="workspace-history-card__metadata">{values.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>; }
+function Heading({ icon, eyebrow, title, children }: { icon: React.ReactNode; eyebrow: string; title: string; children?: React.ReactNode }) { return <div className="flex flex-wrap items-start justify-between gap-3"><div className="flex gap-3"><span className="incident-panel__icon">{icon}</span><div><p className="eyebrow">{eyebrow}</p><h2 className="mt-1 text-lg font-semibold">{title}</h2></div></div>{children}</div>; }
+function Block({ label, value, subdued = false }: { label: string; value: string; subdued?: boolean }) { return <div className={`incident-longform ${subdued ? "is-subdued" : ""}`}><p className="mono incident-longform__label text-[9px] uppercase tracking-[.13em] text-[var(--faint)]">{label}</p><p className="incident-longform__body whitespace-pre-wrap text-[var(--ink-soft)]">{value}</p></div>; }
+function Empty({ text }: { text: string }) { return <div className="incident-panel__empty"><InvestigateIcon /><p>{text}</p><span>Only persisted incident information is shown.</span></div>; }
+function HistoryEmpty({ text }: { text: string }) { return <p className="workspace-preserve-log__empty">{text}</p>; }
+function Datum({ label, value }: { label: string; value: string }) { return <div className="rounded-2xl border border-[var(--line)] bg-white/60 p-3"><p className="mono text-[9px] uppercase text-[var(--faint)]">{label}</p><p className="mt-2 text-sm font-semibold">{value}</p></div>; }

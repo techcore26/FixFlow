@@ -1,0 +1,1 @@
+export const disclosure={telemetry:"Simulated demo telemetry",slack:"Simulated Slack activity",onCall:"Illustrative on-call assignment",impact:"Illustrative demo figure",switch:"Switch Gateway is not connected — findings are entered manually"} as const;

@@ -1,0 +1,2 @@
+import type { Metadata } from "next"; import { AppShell } from "@/components/layout/app-shell"; import { IncidentDetailView } from "@/components/incidents/incident-detail-view";
+export const metadata:Metadata={title:"Incident details"}; export default async function IncidentPage({params}:{params:Promise<{id:string}>}){const{id}=await params;return <AppShell title="Incident details" kicker="Review · Decide · Track"><IncidentDetailView id={id}/></AppShell>}

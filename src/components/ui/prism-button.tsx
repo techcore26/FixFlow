@@ -1,0 +1,4 @@
+import Link from "next/link"; import type { ButtonHTMLAttributes,ReactNode } from "react";
+const styles="inline-flex min-h-11 items-center justify-center gap-2 rounded-full px-5 text-sm font-semibold transition hover:-translate-y-0.5";
+export function PrismLink({href,children,secondary=false}:{href:string;children:ReactNode;secondary?:boolean}){return <Link href={href} className={`${styles} ${secondary?"border border-[var(--line)] bg-white/70 text-[var(--ink)]":"bg-[var(--prism)] text-white shadow-[0_12px_30px_rgba(143,108,240,.24)]"}`}>{children}</Link>}
+export function PrismButton({className="",children,...props}:ButtonHTMLAttributes<HTMLButtonElement>){return <button className={`${styles} bg-[var(--prism)] text-white shadow-[0_12px_30px_rgba(143,108,240,.24)] disabled:cursor-not-allowed disabled:opacity-50 ${className}`} {...props}>{children}</button>}

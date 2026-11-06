@@ -1,0 +1,23 @@
+node_modules/
+.next/
+out/
+*.log
+*.tsbuildinfo
+.DS_Store
+.env*
+!.env.example
+
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.db-journal
+tests/.tmp/
+
+
+# Local development configuration and internal project notes
+litellm-config.yaml
+project-memory.md
+session-handoff.md
+
+# Local design reference archive
+fixflow-website-design.zip
