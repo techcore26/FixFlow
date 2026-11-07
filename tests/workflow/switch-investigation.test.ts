@@ -18,7 +18,14 @@ afterEach(async () => { const done = resources.splice(0); for (const item of don
 
 class FakeTransport implements SwitchBridgeTransport {
   sends = 0; events: unknown[] = []; failure: Error | null = null;
-  async sendMessage() { this.sends += 1; if (this.failure) throw this.failure; return { eventId: "switch-event-1" }; }
+  sentMessages: string[] = [];
+
+  async sendMessage(content: string) {
+    this.sends += 1;
+    this.sentMessages.push(content);
+    if (this.failure) throw this.failure;
+    return { eventId: "switch-event-1" };
+  }
   async pollRoomEvents() { return this.events as never[]; }
 }
 async function queued() { const { database, service } = await setup(); const incident = await service.create({ title: "Bridge check", description: "Investigate safely", severity: "HIGH" }); const result = await service.queueSwitchInvestigation(incident.id, { expectedVersion: incident.version }, { requestId: "123e4567-e89b-12d3-a456-426614174000", expectedRoomId: "room-1", expectedSenderId: "agent-target", deadlineAt: new Date(Date.now() + 60_000) }); return { database, result, incident }; }
@@ -33,6 +40,16 @@ test("queues transactionally, audits, dispatches once, and isolates the untruste
   const { database, result, incident } = await queued(); const transport = new FakeTransport(); const worker = new SwitchInvestigationWorkerService(database.db, transport, "worker-a");
   await assert.rejects(new IncidentService(database.db).queueSwitchInvestigation(incident.id, { expectedVersion: result.incident.version }, { requestId: "123e4567-e89b-12d3-a456-426614174001", expectedRoomId: "room-1", expectedSenderId: "agent-target", deadlineAt: new Date(Date.now() + 60_000) }));
   await worker.dispatchOne(); await worker.dispatchOne(); assert.equal(transport.sends, 1);
+
+  assert.ok(transport.sentMessages[0].startsWith("FIXFLOW_INVESTIGATION_REQUEST\n"));
+  const request = JSON.parse(
+    transport.sentMessages[0].slice("FIXFLOW_INVESTIGATION_REQUEST\n".length)
+  );
+  assert.equal(request.requestId, "123e4567-e89b-12d3-a456-426614174000");
+  assert.equal(request.incident.title, incident.title);
+  assert.equal(request.incident.description, incident.description);
+  assert.equal(request.incident.severity, incident.severity);
+  assert.equal(request.incident.status, "INVESTIGATING");
   transport.events = [reply()]; await worker.pollOnce();
   const [job] = await database.db.select().from(switchInvestigationJobs); assert.equal(job.status, "RESPONSE_RECEIVED"); assert.match(job.candidateJson ?? "", /Evidence requires human review/);
   assert.equal((await database.db.select().from(approvals)).length, 0); assert.equal((await database.db.select().from(executions)).length, 0);
@@ -47,6 +64,35 @@ test("records definite authentication failure but preserves uncertain delivery w
   assert.equal((await second.database.db.select().from(switchInvestigationJobs))[0].status, "DELIVERY_UNKNOWN"); assert.equal(timeout.sends, 1);
 });
 
+test("classifies pre-dispatch incident lookup failure without uncertain delivery", async () => {
+  const { database } = await queued();
+  const transport = new FakeTransport();
+  const worker = new SwitchInvestigationWorkerService(database.db, transport);
+
+  const incidentQuery = database.db.query.incidents;
+  const originalFindFirst = incidentQuery.findFirst;
+  let failed = false;
+
+  incidentQuery.findFirst = (() => {
+    failed = true;
+    throw new Error("Simulated local database read failure.");
+  }) as typeof originalFindFirst;
+
+  try {
+    await worker.dispatchOne();
+  } finally {
+    incidentQuery.findFirst = originalFindFirst;
+  }
+
+  assert.equal(failed, true, "Incident lookup failure must be exercised.");
+
+  const [job] = await database.db.select().from(switchInvestigationJobs);
+
+  assert.equal(transport.sends, 0);
+  assert.equal(job.status, "FAILED");
+  assert.equal(job.candidateJson, null);
+});
+
 test("rejects wrong, malformed, duplicate, and late replies without workflow side effects", async () => {
   const { database } = await queued(); const transport = new FakeTransport(); const worker = new SwitchInvestigationWorkerService(database.db, transport); await worker.dispatchOne();
   transport.events = [reply(undefined, "unexpected-agent"), reply("123e4567-e89b-12d3-a456-426614174099"), { type: "message", room_id: "room-1", payload: { sender: "agent-target", sender_kind: "agent", message_id: "bad", body: "FIXFLOW_RESULT\nnot-json" } }, { type: "message", room_id: "room-1", payload: { sender: "agent-target", sender_kind: "agent", message_id: "large", body: "x".repeat(14_001) } }]; await worker.pollOnce();
@@ -58,4 +104,107 @@ test("rejects wrong, malformed, duplicate, and late replies without workflow sid
 
 test("expires a pending job with no fabricated findings", async () => {
   const { database } = await queued(); const worker = new SwitchInvestigationWorkerService(database.db, new FakeTransport()); await database.db.update(switchInvestigationJobs).set({ deadlineAt: new Date(Date.now() - 1) }); await worker.expire(); const [job] = await database.db.select().from(switchInvestigationJobs); assert.equal(job.status, "TIMED_OUT"); assert.equal(job.candidateJson, null);
+});
+
+test("recovers an abandoned dispatch lease without resending and accepts a validated reply", async () => {
+  const { database } = await queued();
+  const transport = new FakeTransport();
+  const worker = new SwitchInvestigationWorkerService(database.db, transport, "worker-recovery");
+
+  const [original] = await database.db.select().from(switchInvestigationJobs);
+
+  await database.db.update(switchInvestigationJobs).set({
+    status: "DISPATCHING",
+    leaseOwner: "crashed-worker",
+    leaseExpiresAt: new Date(Date.now() - 1000),
+    attempts: 1,
+  });
+
+  await worker.expire();
+
+  const [recovered] = await database.db.select().from(switchInvestigationJobs);
+
+  assert.equal(recovered.status, "DELIVERY_UNKNOWN");
+  assert.equal(recovered.requestId, original.requestId);
+  assert.equal(recovered.leaseOwner, null);
+  assert.equal(recovered.leaseExpiresAt, null);
+
+  const recoveryAudit = await database.db.select().from(auditEvents);
+  assert.ok(
+    recoveryAudit.some(
+      (event) => event.eventType === "SWITCH_INVESTIGATION_LEASE_EXPIRED"
+    ),
+    "Lease recovery must produce a dedicated audit event.",
+  );
+  assert.equal(
+    recoveryAudit.filter(
+      (event) => event.eventType === "SWITCH_INVESTIGATION_TIMED_OUT"
+    ).length,
+    0,
+    "Lease recovery must not be misreported as an investigation timeout.",
+  );
+
+  await worker.dispatchOne();
+  assert.equal(transport.sends, 0, "An abandoned dispatch must never be resent automatically.");
+
+  transport.events = [reply()];
+  await worker.pollOnce();
+
+  const [completed] = await database.db.select().from(switchInvestigationJobs);
+  assert.equal(completed.status, "RESPONSE_RECEIVED");
+  assert.match(completed.candidateJson ?? "", /Evidence requires human review/);
+});
+
+test("stale worker cannot overwrite a recovered and completed investigation", async () => {
+  const { database } = await queued();
+
+  let rejectSend!: (error: Error) => void;
+  let signalSendStarted!: () => void;
+
+  const sendStarted = new Promise<void>((resolve) => {
+    signalSendStarted = resolve;
+  });
+
+  const transport = new FakeTransport();
+
+  transport.sendMessage = async (content: string) => {
+    transport.sends += 1;
+    transport.sentMessages.push(content);
+    signalSendStarted();
+
+    return new Promise<{ eventId: string }>((_resolve, reject) => {
+      rejectSend = reject;
+    });
+  };
+
+  const staleWorker = new SwitchInvestigationWorkerService(
+    database.db,
+    transport,
+    "stale-worker",
+  );
+
+  const dispatch = staleWorker.dispatchOne();
+  await sendStarted;
+
+  await database.db.update(switchInvestigationJobs).set({
+    leaseExpiresAt: new Date(Date.now() - 1000),
+  });
+
+  const recoveryWorker = new SwitchInvestigationWorkerService(
+    database.db,
+    new FakeTransport(),
+    "recovery-worker",
+  );
+
+  await recoveryWorker.expire();
+  await recoveryWorker.consume([reply()]);
+
+  rejectSend(new SwitchTransportError("TIMEOUT", true, "Delayed failure."));
+  await dispatch;
+
+  const [job] = await database.db.select().from(switchInvestigationJobs);
+
+  assert.equal(job.status, "RESPONSE_RECEIVED");
+  assert.match(job.candidateJson ?? "", /Evidence requires human review/);
+  assert.equal(transport.sends, 1);
 });

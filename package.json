@@ -14,7 +14,7 @@
     "db:generate": "drizzle-kit generate --name=fixflow_initial",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:check": "drizzle-kit check",
-    "switch:worker": "tsx src/server/switch/worker.ts",
+    "switch:worker": "tsx src/server/switch/worker-entry.ts",
     "test:persistence": "tsx --test tests/persistence/*.test.ts",
     "test:workflow": "tsx --test tests/workflow/*.test.ts",
     "test:ui": "tsx --test tests/ui/*.test.ts",

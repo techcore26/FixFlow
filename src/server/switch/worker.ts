@@ -1,14 +1,75 @@
-import { getSwitchConfig } from "@/config/switch";
-import { getDatabase } from "@/db/client";
-import { createSwitchBridgeTransport } from "./bridge-client";
-import { SwitchInvestigationWorkerService } from "./investigation-service";
+import { SwitchTransportError } from "./bridge-client";
+import type { SwitchInvestigationWorkerService } from "./investigation-service";
 
-async function main() {
-  const config = getSwitchConfig();
-  if (!config.enabled) throw new Error("Switch worker is disabled: configure SWITCH_ENABLED=true and all server-only Switch values.");
-  const database = getDatabase(); await database.ready;
-  const worker = new SwitchInvestigationWorkerService(database.db, createSwitchBridgeTransport(config));
-  let stopping = false; const stop = () => { stopping = true; }; process.once("SIGINT", stop); process.once("SIGTERM", stop);
-  while (!stopping) { await worker.expire(); await worker.dispatchOne(); await worker.pollOnce(); }
+type WorkerOperations = Pick<
+  SwitchInvestigationWorkerService,
+  "expire" | "dispatchOne" | "pollOnce"
+>;
+
+function waitForRetry(
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+
+    const timer = setTimeout(finish, milliseconds);
+
+    signal.addEventListener("abort", finish, { once: true });
+
+    if (signal.aborted) finish();
+  });
 }
-void main().catch((error: unknown) => { console.error(error instanceof Error ? error.message : "Switch worker failed."); process.exitCode = 1; });
+
+export async function runSwitchWorker(
+  worker: WorkerOperations,
+  signal: AbortSignal,
+  wait: (milliseconds: number, signal: AbortSignal) => Promise<void> =
+    waitForRetry,
+): Promise<void> {
+  let consecutiveFailures = 0;
+
+  while (!signal.aborted) {
+    try {
+      await worker.expire();
+      if (signal.aborted) break;
+
+      await worker.dispatchOne();
+      if (signal.aborted) break;
+
+      await worker.pollOnce();
+      consecutiveFailures = 0;
+    } catch (error) {
+      if (
+        !(error instanceof SwitchTransportError) ||
+        error.code === "AUTH"
+      ) {
+        throw error;
+      }
+
+      consecutiveFailures += 1;
+
+      const delayMs = Math.min(
+        30_000,
+        1_000 * 2 ** Math.min(consecutiveFailures - 1, 5),
+      );
+
+      console.error(
+        `Switch transport ${error.code}; retrying in ${delayMs}ms (failure ${consecutiveFailures}).`,
+      );
+
+      if (signal.aborted) break;
+
+      await wait(delayMs, signal);
+    }
+  }
+}
