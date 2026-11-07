@@ -105,3 +105,106 @@ test("rejects wrong, malformed, duplicate, and late replies without workflow sid
 test("expires a pending job with no fabricated findings", async () => {
   const { database } = await queued(); const worker = new SwitchInvestigationWorkerService(database.db, new FakeTransport()); await database.db.update(switchInvestigationJobs).set({ deadlineAt: new Date(Date.now() - 1) }); await worker.expire(); const [job] = await database.db.select().from(switchInvestigationJobs); assert.equal(job.status, "TIMED_OUT"); assert.equal(job.candidateJson, null);
 });
+
+test("recovers an abandoned dispatch lease without resending and accepts a validated reply", async () => {
+  const { database } = await queued();
+  const transport = new FakeTransport();
+  const worker = new SwitchInvestigationWorkerService(database.db, transport, "worker-recovery");
+
+  const [original] = await database.db.select().from(switchInvestigationJobs);
+
+  await database.db.update(switchInvestigationJobs).set({
+    status: "DISPATCHING",
+    leaseOwner: "crashed-worker",
+    leaseExpiresAt: new Date(Date.now() - 1000),
+    attempts: 1,
+  });
+
+  await worker.expire();
+
+  const [recovered] = await database.db.select().from(switchInvestigationJobs);
+
+  assert.equal(recovered.status, "DELIVERY_UNKNOWN");
+  assert.equal(recovered.requestId, original.requestId);
+  assert.equal(recovered.leaseOwner, null);
+  assert.equal(recovered.leaseExpiresAt, null);
+
+  const recoveryAudit = await database.db.select().from(auditEvents);
+  assert.ok(
+    recoveryAudit.some(
+      (event) => event.eventType === "SWITCH_INVESTIGATION_LEASE_EXPIRED"
+    ),
+    "Lease recovery must produce a dedicated audit event.",
+  );
+  assert.equal(
+    recoveryAudit.filter(
+      (event) => event.eventType === "SWITCH_INVESTIGATION_TIMED_OUT"
+    ).length,
+    0,
+    "Lease recovery must not be misreported as an investigation timeout.",
+  );
+
+  await worker.dispatchOne();
+  assert.equal(transport.sends, 0, "An abandoned dispatch must never be resent automatically.");
+
+  transport.events = [reply()];
+  await worker.pollOnce();
+
+  const [completed] = await database.db.select().from(switchInvestigationJobs);
+  assert.equal(completed.status, "RESPONSE_RECEIVED");
+  assert.match(completed.candidateJson ?? "", /Evidence requires human review/);
+});
+
+test("stale worker cannot overwrite a recovered and completed investigation", async () => {
+  const { database } = await queued();
+
+  let rejectSend!: (error: Error) => void;
+  let signalSendStarted!: () => void;
+
+  const sendStarted = new Promise<void>((resolve) => {
+    signalSendStarted = resolve;
+  });
+
+  const transport = new FakeTransport();
+
+  transport.sendMessage = async (content: string) => {
+    transport.sends += 1;
+    transport.sentMessages.push(content);
+    signalSendStarted();
+
+    return new Promise<{ eventId: string }>((_resolve, reject) => {
+      rejectSend = reject;
+    });
+  };
+
+  const staleWorker = new SwitchInvestigationWorkerService(
+    database.db,
+    transport,
+    "stale-worker",
+  );
+
+  const dispatch = staleWorker.dispatchOne();
+  await sendStarted;
+
+  await database.db.update(switchInvestigationJobs).set({
+    leaseExpiresAt: new Date(Date.now() - 1000),
+  });
+
+  const recoveryWorker = new SwitchInvestigationWorkerService(
+    database.db,
+    new FakeTransport(),
+    "recovery-worker",
+  );
+
+  await recoveryWorker.expire();
+  await recoveryWorker.consume([reply()]);
+
+  rejectSend(new SwitchTransportError("TIMEOUT", true, "Delayed failure."));
+  await dispatch;
+
+  const [job] = await database.db.select().from(switchInvestigationJobs);
+
+  assert.equal(job.status, "RESPONSE_RECEIVED");
+  assert.match(job.candidateJson ?? "", /Evidence requires human review/);
+  assert.equal(transport.sends, 1);
+});

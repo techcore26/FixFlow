@@ -38,7 +38,19 @@ export class SwitchInvestigationWorkerService {
   private readonly jobs;
   constructor(private readonly db: FixFlowDatabase, private readonly transport: SwitchBridgeTransport, private readonly workerId: string = randomUUID()) { this.jobs = createSwitchInvestigationJobRepository(db); }
   private async audit(job: SwitchInvestigationJob, eventType: string, metadata: Record<string, unknown>) { await this.db.insert(auditEvents).values({ id: randomUUID(), incidentId: job.incidentId, actor: "switch-bridge", eventType, metadata: JSON.stringify({ requestId: job.requestId, ...metadata }) }); }
-  async expire(now = new Date()) { const expired = await this.jobs.expire(now); for (const job of expired) await this.audit(job, "SWITCH_INVESTIGATION_TIMED_OUT", {}); return expired.length; }
+  async expire(now = new Date()) {
+    const expired = await this.jobs.expire(now);
+
+    for (const job of expired) {
+      const eventType = job.status === "TIMED_OUT"
+        ? "SWITCH_INVESTIGATION_TIMED_OUT"
+        : "SWITCH_INVESTIGATION_LEASE_EXPIRED";
+
+      await this.audit(job, eventType, {});
+    }
+
+    return expired.length;
+  }
   async dispatchOne() {
     const job = await this.jobs.claimNext(this.workerId, new Date(Date.now() + 30_000));
     if (!job) return false;
@@ -52,7 +64,7 @@ export class SwitchInvestigationWorkerService {
       const message = requestBody(job, incident);
       sendAttempted = true;
       const sent = await this.transport.sendMessage(message);
-      const [updated] = await this.db.update(switchInvestigationJobs).set({ status: "SENT", outboundEventId: sent.eventId, sentAt: new Date(), leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() }).where(and(eq(switchInvestigationJobs.id, job.id), eq(switchInvestigationJobs.status, "DISPATCHING"))).returning();
+      const [updated] = await this.db.update(switchInvestigationJobs).set({ status: "SENT", outboundEventId: sent.eventId, sentAt: new Date(), leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() }).where(and(eq(switchInvestigationJobs.id, job.id), eq(switchInvestigationJobs.status, "DISPATCHING"), eq(switchInvestigationJobs.leaseOwner, this.workerId))).returning();
       if (updated) await this.audit(updated, "SWITCH_INVESTIGATION_DISPATCHED", { eventId: sent.eventId });
     } catch (error) {
       const transportError = error instanceof SwitchTransportError
@@ -65,7 +77,7 @@ export class SwitchInvestigationWorkerService {
               : "Switch dispatch failed before send was attempted.",
           );
       const status = transportError.deliveryUncertain ? "DELIVERY_UNKNOWN" : "FAILED";
-      const [updated] = await this.db.update(switchInvestigationJobs).set({ status, errorCode: transportError.code, errorMessage: transportError.message, leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() }).where(eq(switchInvestigationJobs.id, job.id)).returning();
+      const [updated] = await this.db.update(switchInvestigationJobs).set({ status, errorCode: transportError.code, errorMessage: transportError.message, leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() }).where(and(eq(switchInvestigationJobs.id, job.id), eq(switchInvestigationJobs.status, "DISPATCHING"), eq(switchInvestigationJobs.leaseOwner, this.workerId))).returning();
       if (updated) await this.audit(updated, status === "FAILED" ? "SWITCH_INVESTIGATION_FAILED" : "SWITCH_INVESTIGATION_DELIVERY_UNKNOWN", { code: transportError.code });
     }
     return true;
